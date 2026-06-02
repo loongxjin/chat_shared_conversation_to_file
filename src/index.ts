@@ -2900,8 +2900,43 @@ async function scrape(
         )
       }
 
-      // Extract messages using puppeteer with provider-aware logic
-      const messages = await puppeteerPage.evaluate((prov: string) => {
+      // ── LLM extraction path (CDP mode) ──────────────────
+      // When --llm is enabled, skip provider-specific DOM parsing
+      // and let the LLM extract conversation turns from the full page HTML.
+      let messages: { role: string; content: string }[]
+      let pageTitle: string
+      let markdownContent: string | null = null
+      let retrievedAt = ''
+
+      if (opts.llm?.enabled) {
+        if (!opts.quiet) console.error(chalk.blue('[3/8] Extracting conversation with LLM...'))
+        const pageHtml = await puppeteerPage.content()
+        const turns = await extractConversationWithLLM(pageHtml, provider, opts.llm)
+        if (!opts.quiet) console.error(chalk.green(`    ✔ LLM extracted ${turns.length} turns`))
+
+        pageTitle = await puppeteerPage.title() || `${provider.charAt(0).toUpperCase() + provider.slice(1)} Conversation`
+        retrievedAt = new Date().toISOString()
+        const titleWithoutPrefix = stripProviderPrefix(pageTitle)
+        const headingPrefix = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'claude' ? 'Claude' : 'ChatGPT'
+        const lines: string[] = [
+          `# ${headingPrefix} Conversation: ${titleWithoutPrefix}`,
+          '',
+          `Source: ${url}`,
+          `Retrieved: ${retrievedAt}`,
+          ''
+        ]
+        for (const turn of turns) {
+          lines.push(`## ${turn.role === 'user' ? 'User' : 'Assistant'}`, '')
+          lines.push(turn.content.trim())
+          lines.push('')
+        }
+        markdownContent = normalizeLineTerminators(lines.join('\n'))
+
+        // Build messages array so the cleanup + return path below works
+        messages = turns.map(t => ({ role: t.role, content: t.content }))
+      } else {
+        // ── DOM-based extraction (original CDP logic) ──────
+        messages = await puppeteerPage.evaluate((prov: string) => {
         const results: { role: string; content: string }[] = []
 
         if (prov === 'chatgpt') {
@@ -2958,7 +2993,7 @@ async function scrape(
       }, provider)
 
       // Get page title
-      const pageTitle = await puppeteerPage.title() || `${provider.charAt(0).toUpperCase() + provider.slice(1)} Conversation`
+      pageTitle = await puppeteerPage.title() || `${provider.charAt(0).toUpperCase() + provider.slice(1)} Conversation`
 
       // Apply alternating role fallback for any remaining unknown messages (ChatGPT GPT-5.2+)
       if (provider === 'chatgpt' || provider === 'grok' || provider === 'gemini') {
@@ -2970,6 +3005,7 @@ async function scrape(
           }
         }
       }
+      } // end else (DOM extraction path)
 
       // Close puppeteer browser
       await puppeteerBrowser.disconnect()
@@ -3074,9 +3110,19 @@ async function scrape(
         if (!opts.quiet) console.error(chalk.gray('    Temporary session closed'))
       }
 
-      // Convert to markdown using turndown
-      // Use same format as Playwright mode for consistency
-      const retrievedAt = new Date().toISOString()
+      // ── Assemble markdown output ────────────────────────
+      // LLM path: markdown already assembled, skip Turndown.
+      // DOM path: convert HTML to markdown via Turndown.
+      if (markdownContent) {
+        return {
+          title: pageTitle.replace(/\s*[-|].*$/, '').trim() || `${provider.charAt(0).toUpperCase() + provider.slice(1)} Conversation`,
+          markdown: markdownContent,
+          retrievedAt
+        }
+      }
+
+      // Convert to markdown using turndown (DOM extraction path)
+      retrievedAt = new Date().toISOString()
       const titleWithoutPrefix = stripProviderPrefix(pageTitle)
       const headingPrefix = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'claude' ? 'Claude' : 'ChatGPT'
       const lines: string[] = [
