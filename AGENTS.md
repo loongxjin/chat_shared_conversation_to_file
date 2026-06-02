@@ -125,8 +125,8 @@ When adding a new provider:
 
 1. Add to `Provider` type union
 2. Add URL patterns to `PROVIDER_PATTERNS`
-3. Add CSS selector fallback chains to `SELECTOR_FALLBACKS`
-4. Update `sharePattern` regex for URL validation
+3. Add CSS selector fallback chains to `PROVIDER_SELECTOR_CANDIDATES`
+4. Update `sharePattern` regex for URL validation (DOM mode only)
 5. Test in both headless and headful modes
 6. Handle Cloudflare/bot-detection if present (may need CDP mode)
 
@@ -134,6 +134,29 @@ CDP Mode (for Cloudflare-protected sites):
 - Connects to user's real Chrome via `--remote-debugging-port=9222`
 - Saves/restores user's open tabs (macOS only via AppleScript)
 - Prompts user to solve Cloudflare challenges manually
+
+### LLM Extraction Mode (`--llm`)
+
+An alternative extraction path that skips CSS selectors and DOM parsing entirely:
+
+1. Playwright (or CDP for Claude) loads the page and executes JS
+2. `page.content()` grabs the full rendered HTML
+3. `preprocessHtmlForLLM()` strips framework noise (script, style, Angular/Vue/React attributes, whitespace)
+4. The cleaned HTML is sent to an OpenAI-compatible LLM API
+5. The LLM returns a JSON array of `{role, content}` turns
+6. Markdown is assembled directly (no Turndown needed)
+
+Key architecture:
+- `extractConversationWithLLM()` — calls the LLM API, parses JSON response
+- `preprocessHtmlForLLM()` — framework-agnostic HTML cleaner (attribute whitelist, not framework-specific)
+- LLM branch inserted in both CDP and Playwright paths, returning early before DOM extraction
+- `Provider` type includes `'other'` — LLM mode accepts ANY URL, `detectProvider()` derives a display name from the hostname
+
+Configuration:
+- `LLM_API_KEY` env var or `--llm-api-key`
+- `LLM_BASE_URL` env var (default `https://api.openai.com/v1`) or `--llm-base-url`
+- `LLM_MODEL` env var (default `gpt-4o-mini`) or `--llm-model`
+- `.env` file auto-loaded at startup (also `.env.example` template provided)
 
 ---
 
@@ -180,11 +203,15 @@ bun run test:e2e           # E2E tests (requires CSCTF_E2E=1)
 
 For manual testing:
 ```bash
-# Test a provider
+# Test a provider (DOM mode)
 bun run src/index.ts https://chatgpt.com/share/<id>
 bun run src/index.ts https://gemini.google.com/share/<id>
 bun run src/index.ts https://x.com/i/grok/share/<id>
 bun run src/index.ts https://claude.ai/share/<id>  # Requires CDP mode
+
+# Test LLM mode (any platform)
+bun run src/index.ts https://gemini.google.com/share/<id> --llm
+bun run src/index.ts https://chat.deepseek.com/share/<id> --llm
 
 # Test output formats
 bun run src/index.ts <url> --html        # Markdown + HTML

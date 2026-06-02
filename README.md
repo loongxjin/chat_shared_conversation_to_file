@@ -24,6 +24,7 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/chat_shared_conv
 - **Deterministic filenames**: Slugifies the conversation title and auto-increments to avoid clobbering existing files.
 - **Readable progress**: Colorized, step-based console output powered by `chalk`.
 - **Multi-provider**: Works with public shares from ChatGPT (`chatgpt.com/share`), Gemini (`gemini.google.com/share`), Grok (`grok.com/share`), and Claude (`claude.ai/share`).
+- **LLM mode (`--llm`)**: Universal extraction via LLM — works with ANY AI chat platform (DeepSeek, Kimi, Poe, Perplexity, etc.). Resilient to DOM changes.
 
 ## 💡 Why csctf exists
 - Copy/pasting AI share links often breaks fenced code blocks, loses language hints, and produces messy filenames. csctf fixes that with stable slugs, language-preserving fences, and collision-proof outputs.
@@ -63,6 +64,14 @@ Claude.ai uses Cloudflare protection that blocks standard browser automation. cs
 
 This approach requires Chrome to be installed and you to be logged into claude.ai in your regular Chrome session.
 
+**LLM mode (`--llm`, any platform):**
+1) Same browser launch as above (Playwright or CDP depending on the platform).
+2) After page load, captures the full rendered HTML.
+3) Strips framework noise (Angular/Vue/React attributes, scripts, styles) — ~96% reduction.
+4) Sends the cleaned HTML to an OpenAI-compatible LLM API.
+5) Parses the LLM's JSON response into conversation turns.
+6) Assembles Markdown directly (no CSS selectors or Turndown conversion needed).
+
 **Publishing (optional, all providers):**
 - If requested, publish: resolve repo/branch/dir, clone (or create via gh), copy files, regenerate `manifest.json` and `index.html`, commit+push.
 - Log steps with timing, print saved paths and optional viewer hint.
@@ -100,6 +109,10 @@ This approach requires Chrome to be installed and you to be logged into claude.a
   `PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright csctf <url>`
 - Longer/slower shares:
   `csctf <url> --timeout-ms 90000`
+- LLM extraction (universal platform support):
+  `csctf <url> --llm --llm-model deepseek-chat --llm-base-url https://api.deepseek.com`
+- LLM with local model (Ollama):
+  `csctf <url> --llm --llm-base-url http://localhost:11434/v1 --llm-model llama3`
 
 ## ⚡ Quickstart
 - macOS/Linux:
@@ -114,10 +127,15 @@ This approach requires Chrome to be installed and you to be logged into claude.a
 After install, just pass a share URL:
 
 ```bash
+# DOM mode — fast, offline, provider-specific CSS selectors
 csctf https://chatgpt.com/share/69343092-91ac-800b-996c-7552461b9b70
 csctf https://grok.com/share/bGVnYWN5_d5329c61-f497-40b7-9472-c555fa71af9c
 csctf https://gemini.google.com/share/66d944b0e6b9
 csctf https://claude.ai/share/549c846d-f6c8-411c-9039-a9a14db376cf
+
+# LLM mode — universal, any AI platform, requires API key
+csctf https://chat.deepseek.com/share/<id> --llm
+csctf https://kimi.moonshot.cn/share/<id> --llm
 ```
 
 You'll get two files in your current directory with a clean, collision-proof name:
@@ -129,6 +147,7 @@ You'll get two files in your current directory with a clean, collision-proof nam
 csctf <share-url> \
   [--timeout-ms 60000] [--outfile path] [--quiet] [--check-updates] [--version] \
   [--no-html] [--html-only] [--md-only] \
+  [--llm] [--llm-api-key <key>] [--llm-base-url <url>] [--llm-model <model>] \
   [--publish-to-gh-pages] [--gh-pages-repo owner/name] [--gh-pages-branch gh-pages] [--gh-pages-dir csctf] \
   [--remember] [--forget-gh-pages] [--dry-run] [--yes] [--gh-install]
 
@@ -159,6 +178,70 @@ What you'll see:
 | `--dry-run` | off | Build index without push | Skips commit/push. |
 | `--yes` / `--no-confirm` | off | Skip `PROCEED` prompt | Use in CI or scripted runs. |
 | `--gh-install` | off | Auto-install `gh` | Tries brew/apt/dnf/yum/winget/choco. |
+| `--llm` | off | Use LLM to extract conversation | Skips DOM parsing. Requires API key. |
+| `--llm-api-key` | env `LLM_API_KEY` | API key for LLM | OpenAI-compatible format. |
+| `--llm-base-url` | `https://api.openai.com/v1` | LLM API endpoint | Also via `LLM_BASE_URL` env var. |
+| `--llm-model` | `gpt-4o-mini` | Model name | Also via `LLM_MODEL` env var. |
+
+## 🤖 LLM Mode (`--llm`)
+
+An alternative extraction path that uses an LLM instead of CSS selectors to parse conversations. **Universal — works with ANY AI chat platform** (DeepSeek, Kimi, Poe, Perplexity, etc.), not just the 4 built-in providers.
+
+### Quick setup
+
+```bash
+# Copy the template and fill in your API key
+cp .env.example .env
+# Edit .env → LLM_API_KEY=sk-your-key-here
+
+# Run (LLM auto-detects platform from URL)
+csctf https://chat.deepseek.com/share/<id> --llm
+```
+
+### How it works
+
+1. Playwright loads the page and executes JavaScript (required for SPAs)
+2. Full rendered HTML is stripped of framework noise (Angular/Vue/React attributes, scripts, styles) — ~96% size reduction
+3. The cleaned HTML is sent to the LLM with a system prompt asking for `{"turns": [{role, content}, ...]}` JSON
+4. Markdown is assembled directly from the LLM response (no Turndown conversion)
+
+### Configuration
+
+| Source | Variable |
+|--------|----------|
+| `.env` file | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` |
+| CLI flags | `--llm-api-key`, `--llm-base-url`, `--llm-model` |
+| Environment | `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL` |
+
+Priority: CLI flags > environment variables > `.env` file > defaults.
+
+### Supported LLM providers
+
+Any OpenAI-compatible API works:
+
+```bash
+# OpenAI
+csctf <url> --llm
+
+# DeepSeek
+csctf <url> --llm --llm-base-url https://api.deepseek.com --llm-model deepseek-chat
+
+# Kimi / Moonshot
+csctf <url> --llm --llm-base-url https://api.moonshot.cn/v1 --llm-model moonshot-v1-8k
+
+# Ollama (local)
+csctf <url> --llm --llm-base-url http://localhost:11434/v1 --llm-model llama3
+```
+
+### LLM vs DOM mode
+
+| | DOM mode (default) | LLM mode (`--llm`) |
+|---|---|---|
+| **Platforms** | ChatGPT, Gemini, Grok, Claude | Any AI platform URL |
+| **Speed** | Fast (no API call) | Slower (LLM round-trip) |
+| **Cost** | Free | API token cost |
+| **Resilience** | Breaks when DOM changes | Resilient to DOM changes |
+| **Network** | Page load only | Page load + LLM API call |
 
 ## 🗂️ Outputs
 - Markdown header: `# Conversation: <title>`, plus `Source` and `Retrieved` lines.
@@ -168,6 +251,7 @@ What you'll see:
 
 ## 🔒 Security & network behavior
 - Network calls: only the share URL, plus optional `--check-updates` and GitHub publish flows.
+- LLM mode (`--llm`) adds a single API call to your configured LLM endpoint (page HTML is sent for conversation extraction).
 - Uses the GitHub CLI (`gh`) for publish auth; no tokens are stored.
 - Chromium downloaded once and cached for ChatGPT/Gemini/Grok; Claude.ai uses your installed Chrome with copied session cookies.
 
@@ -275,7 +359,8 @@ The `postinstall` script patches Playwright's dynamic path resolution for compat
 ## ⚠️ Limitations & known behaviors
 - ChatGPT, Gemini, and Grok use headless Chromium; Claude.ai requires your installed Chrome with an active login session.
 - Requires public share links; private/authenticated shares are not supported (except Claude.ai which uses your session).
-- Provider layouts may change; selectors are maintained for ChatGPT, Gemini, Grok, and Claude with fallback chains.
+- DOM mode: provider layouts may change; selectors are maintained for ChatGPT, Gemini, Grok, and Claude with fallback chains.
+- LLM mode (`--llm`): works with any platform but requires an API call (latency + cost). Resilient to DOM changes.
 - Markdown/HTML exports require the share to remain available at scrape time.
 - Update checks and GH publishing are opt-in; otherwise no outbound calls beyond fetching the share page.
 - Claude.ai on macOS: if Chrome is running, the tool will offer to save your tabs, restart Chrome with debugging, and restore your tabs afterward.
@@ -294,6 +379,9 @@ The `postinstall` script patches Playwright's dynamic path resolution for compat
 - **Which Markdown rules are customized?** A turndown rule injects fenced code blocks with detected language from `class="language-..."`; citation pills and data-start/end attributes are stripped.
 - **Why does Claude.ai need my Chrome?** Claude.ai uses Cloudflare protection that blocks headless browsers. By using your real Chrome with your existing login cookies, the tool can bypass this protection.
 - **Are my Chrome cookies safe?** Yes. Cookies are copied to a temporary directory for the scraping session only; your original Chrome profile is never modified.
+- **Which LLM providers work?** Any OpenAI-compatible API works — OpenAI, DeepSeek, Kimi (Moonshot), Ollama (local), and many others. Set `--llm-base-url` to match your provider.
+- **Does LLM mode work for all platforms?** Yes. Since the LLM reads the full HTML and understands its structure, there's no need for per-platform CSS selectors. Any AI chat share page URL should work.
+- **Is LLM mode expensive?** The HTML is stripped of ~96% of noise before sending, resulting in ~10K tokens per request. With gpt-4o-mini, this costs < $0.01 per conversation.
 
 ## 📝 About Contributions
 
