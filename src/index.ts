@@ -30,7 +30,7 @@ if (fs.existsSync(dotenvPath)) {
   }
 }
 
-type Provider = 'chatgpt' | 'gemini' | 'grok' | 'claude'
+type Provider = 'chatgpt' | 'gemini' | 'grok' | 'claude' | 'other'
 const PROVIDER_PATTERNS: { id: Provider; patterns: RegExp[] }[] = [
   { id: 'gemini', patterns: [/gemini\.google\.com$/i] },
   { id: 'grok', patterns: [/grok\.com$/i, /grok\.x\.ai$/i] },
@@ -67,6 +67,12 @@ const PROVIDER_SELECTOR_CANDIDATES: Record<Provider, string[][]> = {
     // Fallback patterns
     ['.max-w-3xl.mx-auto [data-testid]', '.max-w-3xl.mx-auto [data-is-streaming]'],
     ['div.gap-3 > div > [data-testid="user-message"]', 'div.gap-3 > div [data-is-streaming]']
+  ],
+  other: [
+    // Generic fallback for unknown AI platforms (used in --llm mode only)
+    ['[data-message-author-role]'],
+    ['[data-testid*="message"]'],
+    ['article']
   ]
 }
 class AppError extends Error {
@@ -1939,7 +1945,22 @@ function detectProvider(url: string): Provider {
   } catch {
     // ignore
   }
-  return 'chatgpt'
+  return 'other'
+}
+
+/** Human-readable provider name for headings and filenames. */
+function providerDisplayName(provider: Provider, url: string): string {
+  if (provider === 'gemini') return 'Gemini'
+  if (provider === 'grok') return 'Grok'
+  if (provider === 'claude') return 'Claude'
+  if (provider === 'chatgpt') return 'ChatGPT'
+  // Derive from hostname for unknown providers
+  try {
+    const host = new URL(url).hostname.replace(/^www\./, '').split('.')[0]
+    return host.charAt(0).toUpperCase() + host.slice(1)
+  } catch {
+    return 'AI'
+  }
 }
 
 // ────────────────────────────────────────────────────────
@@ -2023,6 +2044,7 @@ interface LLMConversationTurn {
 async function extractConversationWithLLM(
   pageHtml: string,
   provider: Provider,
+  providerDisplay: string,
   llm: LLMOptions
 ): Promise<LLMConversationTurn[]> {
   const cleaned = preprocessHtmlForLLM(pageHtml)
@@ -2030,7 +2052,8 @@ async function extractConversationWithLLM(
     provider === 'gemini' ? 'Google Gemini'
     : provider === 'grok' ? 'Grok (xAI)'
     : provider === 'claude' ? 'Claude (Anthropic)'
-    : 'ChatGPT (OpenAI)'
+    : provider === 'chatgpt' ? 'ChatGPT (OpenAI)'
+    : providerDisplay
 
   const userMessage = `The following HTML is from a ${providerHint} share page. Extract all conversation turns.\n\n${cleaned}`
 
@@ -2911,13 +2934,13 @@ async function scrape(
       if (opts.llm?.enabled) {
         if (!opts.quiet) console.error(chalk.blue('[3/8] Extracting conversation with LLM...'))
         const pageHtml = await puppeteerPage.content()
-        const turns = await extractConversationWithLLM(pageHtml, provider, opts.llm)
+        const turns = await extractConversationWithLLM(pageHtml, provider, providerDisplayName(provider, url), opts.llm)
         if (!opts.quiet) console.error(chalk.green(`    ✔ LLM extracted ${turns.length} turns`))
 
         pageTitle = await puppeteerPage.title() || `${provider.charAt(0).toUpperCase() + provider.slice(1)} Conversation`
         retrievedAt = new Date().toISOString()
         const titleWithoutPrefix = stripProviderPrefix(pageTitle)
-        const headingPrefix = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'claude' ? 'Claude' : 'ChatGPT'
+          const headingPrefix = providerDisplayName(provider, url)
         const lines: string[] = [
           `# ${headingPrefix} Conversation: ${titleWithoutPrefix}`,
           '',
@@ -3124,7 +3147,7 @@ async function scrape(
       // Convert to markdown using turndown (DOM extraction path)
       retrievedAt = new Date().toISOString()
       const titleWithoutPrefix = stripProviderPrefix(pageTitle)
-      const headingPrefix = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'claude' ? 'Claude' : 'ChatGPT'
+      const headingPrefix = providerDisplayName(provider, url)
       const lines: string[] = [
         `# ${headingPrefix} Conversation: ${titleWithoutPrefix}`,
         '',
@@ -3386,16 +3409,12 @@ async function scrape(
     if (opts.llm?.enabled) {
       if (!opts.quiet) console.error(chalk.blue('[3/8] Extracting conversation with LLM...'))
       const pageHtml = await page.content()
-      const turns = await extractConversationWithLLM(pageHtml, provider, opts.llm)
+      const turns = await extractConversationWithLLM(pageHtml, provider, providerDisplayName(provider, url), opts.llm)
       if (!opts.quiet) {
         console.error(chalk.green(`  ✔ LLM extracted ${turns.length} turns`))
       }
       const retrievedAt = new Date().toISOString()
-      const headingPrefix =
-        provider === 'gemini' ? 'Gemini'
-        : provider === 'grok' ? 'Grok'
-        : provider === 'claude' ? 'Claude'
-        : 'ChatGPT'
+      const headingPrefix = providerDisplayName(provider, url)
       const lines: string[] = []
       lines.push(`# ${headingPrefix} Conversation: ${stripProviderPrefix(title)}`)
       lines.push('')
@@ -3581,7 +3600,7 @@ async function scrape(
 
     const lines: string[] = []
     const titleWithoutPrefix = stripProviderPrefix(title)
-    const headingPrefix = provider === 'gemini' ? 'Gemini' : provider === 'grok' ? 'Grok' : provider === 'claude' ? 'Claude' : 'ChatGPT'
+    const headingPrefix = providerDisplayName(provider, url)
     lines.push(`# ${headingPrefix} Conversation: ${titleWithoutPrefix}`)
     lines.push('')
     const retrievedAt = new Date().toISOString()
@@ -3735,15 +3754,24 @@ async function main(): Promise<void> {
     usage()
     process.exit(1)
   }
-  const sharePattern =
-    /^https?:\/\/(chatgpt\.com|share\.chatgpt\.com|chat\.openai\.com|gemini\.google\.com|grok\.com|grok\.x\.ai|claude\.ai)\/share\//i
-  if (!sharePattern.test(url)) {
-    fail(
-      'The URL should be a public ChatGPT, Gemini, Grok, or Claude share link (e.g., https://chatgpt.com/share/<id>, https://gemini.google.com/share/<id>, https://grok.com/share/<id>, or https://claude.ai/share/<id>).'
-    )
-    process.exit(1)
+  // LLM mode: accept any http(s) URL (no provider restriction).
+  // DOM mode: only known share link formats.
+  if (!opts.llm.enabled) {
+    const sharePattern =
+      /^https?:\/\/(chatgpt\.com|share\.chatgpt\.com|chat\.openai\.com|gemini\.google\.com|grok\.com|grok\.x\.ai|claude\.ai)\/share\//i
+    if (!sharePattern.test(url)) {
+      fail(
+        'The URL should be a public ChatGPT, Gemini, Grok, or Claude share link (e.g., https://chatgpt.com/share/<id>, https://gemini.google.com/share/<id>, https://grok.com/share/<id>, or https://claude.ai/share/<id>). Use --llm for any URL.'
+      )
+      process.exit(1)
+    }
   }
   const provider = detectProvider(url)
+
+  // LLM mode with unknown provider: warn but proceed (LLM is provider-agnostic).
+  if (opts.llm.enabled && provider === 'other' && !quiet) {
+    console.error(chalk.yellow(`\n⚠️  Unrecognized provider. LLM will attempt to extract conversation from: ${url}`))
+  }
   const effectiveHeadless = headless !== false
 
   if (forgetGh) {
@@ -3801,7 +3829,7 @@ async function main(): Promise<void> {
     const endConvert = step(idx++, totalSteps, 'Converting to Markdown')
     const datePrefix = new Date().toISOString().slice(0, 10)
     const baseTitle = titleOverride || title
-    const name = `${datePrefix}-${provider}-${slugify(stripProviderPrefix(baseTitle))}`
+    const name = `${datePrefix}-${providerDisplayName(provider, url).toLowerCase()}-${slugify(stripProviderPrefix(baseTitle))}`
     const resolvedOutfile = outputDir
       ? path.resolve(outputDir)
       : outfile
