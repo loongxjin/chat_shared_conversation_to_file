@@ -13,6 +13,23 @@ import os from 'os'
 import readline from 'readline'
 import pkg from '../package.json' assert { type: 'json' }
 
+// Load .env file if present (Bun auto-loads it in dev, but compiled binaries need explicit loading).
+const dotenvPath = path.join(process.cwd(), '.env')
+if (fs.existsSync(dotenvPath)) {
+  const envContent = fs.readFileSync(dotenvPath, 'utf-8')
+  for (const line of envContent.split('\n')) {
+    const trimmed = line.trim()
+    if (!trimmed || trimmed.startsWith('#')) continue
+    const eqIdx = trimmed.indexOf('=')
+    if (eqIdx === -1) continue
+    const key = trimmed.slice(0, eqIdx).trim()
+    const value = trimmed.slice(eqIdx + 1).trim().replace(/^["']|["']$/g, '')
+    if (key && !(key in process.env)) {
+      process.env[key] = value
+    }
+  }
+}
+
 type Provider = 'chatgpt' | 'gemini' | 'grok' | 'claude'
 const PROVIDER_PATTERNS: { id: Provider; patterns: RegExp[] }[] = [
   { id: 'gemini', patterns: [/gemini\.google\.com$/i] },
@@ -67,6 +84,13 @@ type ScrapedMessage = {
   html: string
 }
 
+type LLMOptions = {
+  enabled: boolean
+  apiKey: string
+  baseUrl: string
+  model: string
+}
+
 type CliOptions = {
   timeoutMs: number
   outfile?: string
@@ -99,6 +123,7 @@ type CliOptions = {
   useChromeProfile: boolean
   stealthMode: boolean
   cdpEndpoint?: string
+  llm: LLMOptions
 }
 
 type ParsedArgs = CliOptions & { url: string }
@@ -771,6 +796,10 @@ function parseArgs(args: string[]): ParsedArgs {
   let useChromeProfile = false
   let stealthMode = false
   let cdpEndpoint: string | undefined
+  let llmEnabled = false
+  let llmApiKey = process.env.LLM_API_KEY ?? ''
+  let llmBaseUrl = process.env.LLM_BASE_URL ?? 'https://api.openai.com/v1'
+  let llmModel = process.env.LLM_MODEL ?? 'gpt-4o-mini'
 
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]
@@ -920,6 +949,33 @@ function parseArgs(args: string[]): ParsedArgs {
       case '--gh-install':
         autoInstallGh = true
         break
+      case '--llm':
+        llmEnabled = true
+        break
+      case '--llm-api-key':
+        if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+          llmApiKey = args[i + 1] ?? ''
+          i += 1
+        } else {
+          throw new AppError('--llm-api-key requires a value')
+        }
+        break
+      case '--llm-base-url':
+        if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+          llmBaseUrl = args[i + 1] ?? llmBaseUrl
+          i += 1
+        } else {
+          throw new AppError('--llm-base-url requires a URL')
+        }
+        break
+      case '--llm-model':
+        if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+          llmModel = args[i + 1] ?? llmModel
+          i += 1
+        } else {
+          throw new AppError('--llm-model requires a model name')
+        }
+        break
       default:
         if (!url && !arg.startsWith('-')) {
           url = arg
@@ -933,6 +989,9 @@ function parseArgs(args: string[]): ParsedArgs {
   }
   if (htmlOnly && !generateHtml) {
     throw new Error('Cannot combine --html-only and --no-html')
+  }
+  if (llmEnabled && !llmApiKey) {
+    throw new AppError('--llm requires an API key. Use --llm-api-key or set LLM_API_KEY environment variable.')
   }
 
   return {
@@ -967,7 +1026,13 @@ function parseArgs(args: string[]): ParsedArgs {
     autoInstallGh,
     useChromeProfile,
     stealthMode,
-    cdpEndpoint
+    cdpEndpoint,
+    llm: {
+      enabled: llmEnabled,
+      apiKey: llmApiKey,
+      baseUrl: llmBaseUrl,
+      model: llmModel
+    }
   }
 }
 
@@ -1877,6 +1942,151 @@ function detectProvider(url: string): Provider {
   return 'chatgpt'
 }
 
+// ────────────────────────────────────────────────────────
+// LLM-based conversation extraction
+// ────────────────────────────────────────────────────────
+
+/**
+ * Framework-agnostic HTML cleaner for LLM consumption.
+ * Strips all script/style/non-content elements, removes non-semantic attributes,
+ * and collapses whitespace. Works for Angular, React, Vue, Svelte, or any other
+ * framework without special-casing.
+ */
+function preprocessHtmlForLLM(html: string): string {
+  // ── 1. Remove entire elements that carry zero conversation content ──
+  html = html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[\s\S]*?<\/noscript>/gi, '')
+    .replace(/<head[\s\S]*?<\/head>/gi, '')
+    .replace(/<svg[\s\S]*?<\/svg>/gi, '')
+    .replace(/<iframe[\s\S]*?<\/iframe>/gi, '')
+    // Self-closing non-content elements
+    .replace(/<(?:link|meta|base)\b[^>]*\/?>/gi, '')
+    // HTML comments
+    .replace(/<!--[\s\S]*?-->/g, '')
+    // data: URIs (inline images, base64 blobs)
+    .replace(/\sdata:image\/[^"'\s]*/gi, ' DATA_IMAGE_REMOVED')
+
+  // ── 2. Strip every attribute that is NOT in the semantic whitelist ──
+  // Keeps: class, id, role, aria-*, data-testid, data-message-author-role,
+  //        data-author, data-role, data-is-streaming, href, src, alt,
+  //        type, lang, dir
+  html = html.replace(/<[^>]+>/g, tag => {
+    return tag.replace(
+      /\s+([\w-]+)(?:\s*=\s*"[^"]*"|\s*=\s*'[^']*'|\s*=\s*[^\s>]+|\b)/g,
+      (attr, name: string) => {
+        const keepers = new Set([
+          'class', 'id', 'role', 'href', 'src', 'alt', 'type', 'lang', 'dir',
+          'data-testid', 'data-test-id',
+          'data-message-author-role', 'data-author', 'data-role',
+          'data-is-streaming',
+        ])
+        if (keepers.has(name) || name.startsWith('aria-')) return attr
+        return ''
+      }
+    )
+    // Clean up trailing spaces before >
+    .replace(/\s+>/g, '>')
+  })
+
+  // ── 3. Collapse excessive whitespace ──
+  html = html
+    .replace(/\n\s*\n/g, '\n')
+    .replace(/ {2,}/g, ' ')
+    .replace(/^\s+/gm, '')
+    .replace(/\n{2,}/g, '\n')
+
+  return html.trim()
+}
+
+const LLM_SYSTEM_PROMPT = `You are a conversation extraction tool. The user will give you the HTML of an AI chat share page.
+Extract every conversation turn and output valid JSON.
+
+Rules:
+1. Output a JSON object with a "turns" array. Each element has "role" ("user" or "assistant") and "content" (Markdown).
+2. Preserve the original conversation order: user → assistant → user → assistant …
+3. Preserve fenced code blocks with their detected language tag.
+4. Preserve all formatting: bold, italic, lists, tables, headings, blockquotes.
+5. Ignore navigation bars, ads, copyright notices, privacy policies, footers, and other non-conversation content.
+6. Strip prefixes like "You said", "ChatGPT said", or similar role-label artifacts from the content.
+7. The "content" field must be clean Markdown (not HTML).
+8. If you cannot find any conversation, return {"turns":[]}.
+
+Output ONLY the JSON object, nothing else.`
+
+interface LLMConversationTurn {
+  role: 'user' | 'assistant'
+  content: string
+}
+
+async function extractConversationWithLLM(
+  pageHtml: string,
+  provider: Provider,
+  llm: LLMOptions
+): Promise<LLMConversationTurn[]> {
+  const cleaned = preprocessHtmlForLLM(pageHtml)
+  const providerHint =
+    provider === 'gemini' ? 'Google Gemini'
+    : provider === 'grok' ? 'Grok (xAI)'
+    : provider === 'claude' ? 'Claude (Anthropic)'
+    : 'ChatGPT (OpenAI)'
+
+  const userMessage = `The following HTML is from a ${providerHint} share page. Extract all conversation turns.\n\n${cleaned}`
+
+  const endpoint = `${llm.baseUrl.replace(/\/+$/, '').replace(/\/chat\/completions$/, '')}/chat/completions`
+  const body = {
+    model: llm.model,
+    messages: [
+      { role: 'system', content: LLM_SYSTEM_PROMPT },
+      { role: 'user', content: userMessage }
+    ],
+    temperature: 0,
+    response_format: { type: 'json_object' }
+  }
+
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${llm.apiKey}`
+    },
+    body: JSON.stringify(body)
+  })
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new AppError(
+      `LLM API returned HTTP ${resp.status}`,
+      `Response: ${text.slice(0, 500)}. Check your --llm-api-key and --llm-base-url.`
+    )
+  }
+
+  const data = await resp.json() as { choices?: { message?: { content?: string } }[] }
+  const raw = data.choices?.[0]?.message?.content ?? ''
+  if (!raw) {
+    throw new AppError('LLM returned an empty response.', 'Try a different --llm-model.')
+  }
+
+  let parsed: { turns?: LLMConversationTurn[] }
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    throw new AppError('LLM did not return valid JSON.', `Raw response (first 500 chars): ${raw.slice(0, 500)}`)
+  }
+
+  const turns = (parsed.turns ?? []).filter(
+    (t): t is LLMConversationTurn =>
+      (t.role === 'user' || t.role === 'assistant') && typeof t.content === 'string' && t.content.trim().length > 0
+  )
+
+  if (turns.length === 0) {
+    throw new AppError('LLM extracted zero conversation turns.', 'The page may not contain a conversation, or the model failed to parse it.')
+  }
+
+  return turns
+}
+
 async function scrape(
   url: string,
   timeoutMs: number,
@@ -1889,6 +2099,7 @@ async function scrape(
     stealthMode?: boolean
     cdpEndpoint?: string
     quiet?: boolean
+    llm?: LLMOptions
   }
 ): Promise<{ title: string; markdown: string; retrievedAt: string }> {
   const td = buildTurndown()
@@ -3122,10 +3333,50 @@ async function scrape(
     await page.waitForTimeout(Math.min(3000, Math.max(500, timeoutMs / 6)))
 
     const title = await page.title()
+
+    // ── LLM extraction path ──────────────────────────────
+    // When --llm is enabled, skip DOM parsing entirely.
+    // Grab the full rendered HTML and let the LLM extract the conversation.
+    if (opts.llm?.enabled) {
+      if (!opts.quiet) console.error(chalk.blue('[3/8] Extracting conversation with LLM...'))
+      const pageHtml = await page.content()
+      const turns = await extractConversationWithLLM(pageHtml, provider, opts.llm)
+      if (!opts.quiet) {
+        console.error(chalk.green(`  ✔ LLM extracted ${turns.length} turns`))
+      }
+      const retrievedAt = new Date().toISOString()
+      const headingPrefix =
+        provider === 'gemini' ? 'Gemini'
+        : provider === 'grok' ? 'Grok'
+        : provider === 'claude' ? 'Claude'
+        : 'ChatGPT'
+      const lines: string[] = []
+      lines.push(`# ${headingPrefix} Conversation: ${stripProviderPrefix(title)}`)
+      lines.push('')
+      lines.push(`Source: ${url}`)
+      lines.push(`Retrieved: ${retrievedAt}`)
+      lines.push('')
+      for (const turn of turns) {
+        lines.push(`## ${turn.role === 'user' ? 'User' : 'Assistant'}`)
+        lines.push('')
+        lines.push(turn.content.trim())
+        lines.push('')
+      }
+      return { title, markdown: normalizeLineTerminators(lines.join('\n')), retrievedAt }
+    }
+
+    // ── DOM-based extraction path (original logic) ─────
+    // Use only the selector group that findSelector() already identified as matching,
+    // NOT all fallback groups. Flattening all groups would include overly generic
+    // selectors like 'article', 'section', '[role="article"]' that match wrapping
+    // containers (e.g. Gemini's <section class="share-viewer_chat-container">) and
+    // produce duplicate content.
     const selectorGroups =
       opts.waitForSelector && opts.waitForSelector.trim().length > 0
         ? [[opts.waitForSelector]]
-        : PROVIDER_SELECTOR_CANDIDATES[provider] ?? PROVIDER_SELECTOR_CANDIDATES.chatgpt
+        : selector
+          ? [selector.split(',').map(s => s.trim()).filter(Boolean)]
+          : PROVIDER_SELECTOR_CANDIDATES[provider] ?? PROVIDER_SELECTOR_CANDIDATES.chatgpt
     let messages = (await page.evaluate((groups: string[][]) => {
       const normalizeCodeBlocks = (root: HTMLElement) => {
         // Ensure <pre> nodes wrap their text in <code> and preserve whitespace.
@@ -3176,25 +3427,27 @@ async function scrape(
         return clone.innerHTML
       }
 
-      const collectDeep = (root: ParentNode, selectors: string[], acc: Element[], seen: Set<Element>) => {
-        selectors.forEach(sel => {
-          root.querySelectorAll(sel).forEach(node => {
-            if (!seen.has(node)) {
-              seen.add(node)
-              acc.push(node)
-            }
-          })
+      // Use a single comma-joined selector string so querySelectorAll returns
+      // results in true DOM order (CSS spec). Iterating selectors one-by-one
+      // would collect ALL matches for selector-1 before any of selector-2,
+      // breaking the interleaved user/assistant order on Gemini, Grok, etc.
+      const collectDeep = (root: ParentNode, combinedSelector: string, acc: Element[], seen: Set<Element>) => {
+        root.querySelectorAll(combinedSelector).forEach(node => {
+          if (!seen.has(node)) {
+            seen.add(node)
+            acc.push(node)
+          }
         })
         root.childNodes.forEach(child => {
           const asEl = child as Element
           const shadow = (asEl as unknown as { shadowRoot?: ShadowRoot }).shadowRoot
-          if (shadow) collectDeep(shadow, selectors, acc, seen)
+          if (shadow) collectDeep(shadow, combinedSelector, acc, seen)
         })
       }
 
       const selectorsFlat = groups.flat().flatMap(g => g.split(',').map(s => s.trim()).filter(Boolean))
       const nodes: Element[] = []
-      collectDeep(document, selectorsFlat, nodes, new Set<Element>())
+      collectDeep(document, selectorsFlat.join(','), nodes, new Set<Element>())
 
       return nodes
         .map(node => {
@@ -3229,9 +3482,12 @@ async function scrape(
           const inferRole = (): string => {
             // Claude.ai: data-is-streaming indicates assistant response
             if (isStreaming) return 'assistant'
-            const source = `${attrRole} ${testId} ${className}`
-            if (/assistant|bot|system|model|gemini|grok/.test(source)) return 'assistant'
-            if (/user|human|you/.test(source)) return 'user'
+            // Gemini custom elements: <user-query> and <response-container>
+            const tagName = el.tagName?.toLowerCase() ?? ''
+            const source = `${attrRole} ${testId} ${className} ${tagName}`
+            // Word-boundary aware to avoid 'bottom' matching 'bot'
+            if (/\b(?:assistant|bot|system|model|gemini|grok)\b|response-container/.test(source)) return 'assistant'
+            if (/\b(?:user|human|you)\b|user-query/.test(source)) return 'user'
             // GPT-5.2+ uses "You said:" / "ChatGPT said:" headers without role attributes
             // Anchor to start to avoid false positives from "I think you said..." in message content
             const textStart = text.slice(0, 100).toLowerCase()
@@ -3490,7 +3746,8 @@ async function main(): Promise<void> {
       useChromeProfile,
       stealthMode,
       cdpEndpoint,
-      quiet
+      quiet,
+      llm: opts.llm
     })
     endLaunch()
     endOpen()
